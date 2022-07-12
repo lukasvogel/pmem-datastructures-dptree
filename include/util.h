@@ -26,7 +26,7 @@ extern std::vector<uint64_t> notExistKeys;
 extern unsigned long write_latency_in_ns;
 extern unsigned long CPU_FREQ_MHZ;
 extern unsigned long long cycles_total;
-extern int parallel_merge_worker_num;
+static constexpr int parallel_merge_worker_num = 1;
 static constexpr int cacheline_size = 64;
 unsigned long long cycles_now();
 unsigned ctz(unsigned);
@@ -45,7 +45,6 @@ void clflush_then_sfence(volatile void *p);
 void clflush_len(volatile void *data, int len);
 void clflush_len_no_fence(volatile void *data, int len);
 void prefetch(char *ptr, size_t len);
-int nvm_dram_alloc(void **ptr, size_t align, size_t size);
 void nvm_dram_free(void * ptr, size_t size);
 
 int wbinvd();

@@ -53,6 +53,18 @@ add_executable (concur_dptree test/concur_dptree_test.cxx
         src/MurmurHash2.cpp
         src/bloom.c)
 
+
+add_library(dptree_pibench_wrapper SHARED
+        test/dptree_wrapper.cpp
+        src/util.cpp
+        src/ART.cpp
+        misc/ARTOLC/Epoche.cpp
+        misc/ARTOLC/Tree.cpp
+        src/art_idx.cpp
+        src/MurmurHash2.cpp
+        src/bloom.c)
+
+
 add_executable (dptree test/dptree_test.cxx
         src/util.cpp
         src/ART.cpp
@@ -65,3 +77,4 @@ add_executable (dptree test/dptree_test.cxx
 
 target_link_libraries (concur_dptree pthread tbb tcmalloc_minimal)
 target_link_libraries (dptree pthread tbb tcmalloc_minimal)
+target_link_libraries (dptree_pibench_wrapper pthread tbb tcmalloc_minimal)

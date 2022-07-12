@@ -5,7 +5,7 @@
 #include <unistd.h>
 #include <fstream>
 #include <concur_dptree.hpp>
-#include <stx/btree_map>
+//#include <stx/btree_map>
 #include <unordered_set>
 #include <random>
 #include <vector>
@@ -13,8 +13,6 @@
 #include <btreeolc.hpp>
 
 using namespace std;
-
-int parallel_merge_worker_num = 16;
 
 float range_sizes [] = {0.0001,  0.001, 0.01};
 const int repeatn = 50000000;
@@ -31,7 +29,7 @@ uint64_t make_upsert_value(uint64_t v) {
 
 void concur_dptree_test(int nworkers, int n) {
 
-    dptree::concur_dptree<uint64_t, uint64_t> index;
+    dptree::concur_dptree<uint64_t, uint64_t> index("/mnt/pmem0/vogel/dptree.dat");
     auto insert_func = [&](int start, int end) {
         for (int i = start; i < end; ++i) {
             index.insert(keys[i], keys[i]);
@@ -65,13 +63,15 @@ void concur_dptree_test(int nworkers, int n) {
         int repeat = 1;
         int c = 0;
         repeat = repeatn / (end - start) / 2;
+        //std::cout << repeat << std::endl;
+        repeat = 1;
         if (repeat < 1)
             repeat = 1;
         for (uint64_t r = 0; r < repeat; ++r) {
             for (size_t i = start; i < end; i++) {
                 uint64_t key = lookupKeys[i];
                 uint64_t value = 0;
-                bool res = index.lookup(key, value);
+                volatile bool res = index.lookup(key, value);
                 assert(res);
                 assert(key == strip_upsert_value(value));
                 c += 1;
@@ -92,8 +92,6 @@ void concur_dptree_test(int nworkers, int n) {
             end = std::min(end + range_size, (int)n);
         }
         std::for_each(workers.begin(), workers.end(), [](std::thread & t) { t.join(); });
-        printf("probes: %lu\n", index.get_probes());
-        printf("avg probes per lookup: %f\n", index.get_probes() / (count.load() + 0.1));
         return count.load();
     }, "concur-dptree-search");
 
@@ -103,15 +101,12 @@ void concur_dptree_test(int nworkers, int n) {
 int main(int argc, char const *argv[]) {
     int n = 10000000;
     bool sparseKey = false;
-    int nworkers = 1;
+    int nworkers = 24;
     if (argc > 1)
         n = atoi(argv[1]);
     if (argc > 2)
         nworkers = atoi(argv[2]);
-    if (argc > 3)
-        parallel_merge_worker_num = atoi(argv[3]);
-    else
-        parallel_merge_worker_num = nworkers;
+
     if (argc > 4)
         sparseKey = atoi(argv[4]);
     if (argc > 5)

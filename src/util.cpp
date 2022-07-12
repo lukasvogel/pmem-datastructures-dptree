@@ -334,16 +334,11 @@ void clflush_len(volatile void *data, int len)
 #endif
 }
 
-int nvm_dram_alloc(void **ptr, size_t align, size_t size)
-{
-    assert(size < 1073741824UL);
-    int ret = posix_memalign(ptr, align, size);
-    return ret;
-}
+
 
 void nvm_dram_free(void *ptr, size_t size)
 {
-    free(ptr);
+    //free(ptr);
 }
 
 int nvm_dram_alloc_cacheline_aligned(void **p, size_t size)

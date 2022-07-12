@@ -6,13 +6,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <errno.h>
+#include <cerrno>
 #include <mutex>
 #include <set>
-#include <stdio.h>
+#include <cstdio>
 #include <sys/resource.h>
 #include <utility>
-#include <sys/time.h>
+#include <ctime>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -25,7 +25,10 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "stx/btree_map.h"
+#include <fcntl.h>
+#include <glob.h>
+#include <sys/mman.h>
+
 #include "btreeolc.hpp"
 #include "ThreadPool.hpp"
 #include "art_idx.hpp"
@@ -43,11 +46,79 @@
 #include <avx512cdintrin.h>
 #include <avx512dqintrin.h>
 #include <avx512fintrin.h>
+
 #endif
 
-extern int nvm_dram_alloc(void **ptr, size_t align, size_t size);
-extern void nvm_dram_free(void *ptr, size_t size);
-extern void clflush_1mfence(volatile void *p);
+template <int PageSize = 64 * 1024>
+struct log_page
+{
+  uint64_t off;
+  using log_page_type = log_page<PageSize>;
+  log_page_type *next;
+  uint8_t __padding__[END_PADDING_SIZE(sizeof(off) + sizeof(next))];
+  char storage[];
+  log_page() : off(0), next(nullptr) {}
+  static constexpr int page_size = PageSize;
+  static constexpr int meta_size = sizeof(off) + sizeof(next) + sizeof(__padding__);
+  static constexpr int effective_storage_size = page_size - meta_size;
+};
+
+
+template <int PageSize = 64 * 1024>
+class pmem_allocator {
+
+public:
+  uint8_t* pmem_data;
+  std::atomic<size_t> cur_pmem_pos;
+  std::atomic<size_t> cur_pmem_size;
+
+
+  explicit pmem_allocator(const std::string& path) : cur_pmem_pos(0), cur_pmem_size(0) {
+    int fd = open(path.c_str(), O_CREAT | O_RDWR, 0666);
+    if (fd < 0) {
+      throw std::runtime_error("Could not open file at storage location: " + path);
+    }
+
+    size_t size = 600l * 1000 * 1000 * 1000;
+
+    if ((errno = ftruncate(fd, size)) != 0) {
+      throw std::runtime_error(
+          "Could not allocate " + std::to_string(size) + " bytes at storage location: " + path);
+    }
+
+    pmem_data = static_cast<uint8_t *>(mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                                            MAP_SYNC | MAP_SHARED_VALIDATE, fd, 0));
+
+
+  }
+
+  log_page<PageSize> *new_log_page()
+  {
+    void *ptr = nullptr;
+    auto res = nvm_dram_alloc(&ptr, cacheline_size, PageSize);
+    if (res == 0)
+    {
+      return new (ptr) log_page<PageSize>();
+    }
+    return nullptr;
+  }
+
+
+  int nvm_dram_alloc(void **ptr, size_t align, size_t size)
+  {
+    void* mem = pmem_data + cur_pmem_pos.fetch_add(size);
+    cur_pmem_size.fetch_add(size);
+    *ptr = mem;
+    return 0;
+  }
+
+  void nvm_dram_free(void *ptr, size_t size)
+  {
+    cur_pmem_size.fetch_sub(size);
+  }
+
+};
+
 extern void clflush_then_sfence(volatile void *p);
 extern void clflush(volatile void *p);
 extern void mfence();
@@ -258,6 +329,7 @@ public:
     using value_type = Value;
     using kv_pair = std::pair<key_type, value_type>;
     struct leaf_node;
+    std::shared_ptr<pmem_allocator<>> pm_allocator;
     static uint64_t hash2(uint64_t x)
     {
         x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
@@ -445,19 +517,19 @@ public:
         leaf_node *next_sibling(bool v) { return meta[v].next_sibling(); }
         leaf_node **next_sibling_ref(bool v) { return meta[v].next_sibling_ref(); }
 
-        static leaf_node *new_leaf_node()
+        static leaf_node *new_leaf_node(pmem_allocator<>& allocator)
         {
             //return new leaf_node;
             void *ret;
-            nvm_dram_alloc(&ret, cacheline_size, sizeof(leaf_node));
+            allocator.nvm_dram_alloc(&ret, cacheline_size, sizeof(leaf_node));
             return new (ret) leaf_node;
         }
 
-        static void delete_leaf_node(leaf_node *l)
+        static void delete_leaf_node(pmem_allocator<>& allocator, leaf_node *l)
         {
             //delete l;
             //nvm_dram_free_cacheline_aligned(l);
-            nvm_dram_free(l, sizeof(leaf_node));
+            allocator.nvm_dram_free(l, sizeof(leaf_node));
         }
 
         // extract from `bits` `count` consecutive bits starting at off'th bit
@@ -520,7 +592,7 @@ public:
         // Nodes with # keys less than this constant are considered under-utilized
         // and need merging.
         static constexpr int merge_node_threshold = key_capacity / 3;
-        static std::vector<leaf_node *> split_merge_node_with_stream(
+        static std::vector<leaf_node *> split_merge_node_with_stream(pmem_allocator<> &pm_allocator,
             leaf_node *l, typename std::vector<kv_pair>::iterator &upsert_kvs_sit,
             const typename std::vector<kv_pair>::iterator &upsert_kvs_eit, bool cv,
             int &split_merges)
@@ -528,7 +600,8 @@ public:
             std::hash<key_type> hasher;
             ++split_merges;
             bool nv = !cv;
-            std::vector<leaf_node *> leafs = {new_leaf_node()};
+            std::vector<leaf_node *> leafs;
+            leafs.push_back(new_leaf_node(pm_allocator));
             int l_key_count = l->key_count(cv);
             int i = 0;
             bitmap *node_alloc_bitmap = &leafs.back()->meta[nv].get_bitmap();
@@ -536,12 +609,12 @@ public:
                          // moves
             leaf_node *last_leaf = leafs.back();
             auto ensure_last_leaf_capacity = [&last_leaf, &leafs, nv,
-                                              &node_alloc_bitmap]() {
+                                              &node_alloc_bitmap, &pm_allocator]() {
                 if (last_leaf->key_count(nv) >=
                     max_initial_fill_keys)
                 { // last leaf is full, create a new leaf and
                     // establish the chain
-                    auto new_sibling = new_leaf_node();
+                    auto new_sibling = new_leaf_node(pm_allocator);
                     last_leaf->set_max_key(nv);
                     assert(last_leaf->key_count(nv) == node_alloc_bitmap->popcount());
                     *last_leaf->next_sibling_ref(nv) = new_sibling;
@@ -618,14 +691,14 @@ public:
             return leafs;
         }
 
-        static std::vector<leaf_node *> split_node_with_stream(
+        std::vector<leaf_node *> split_node_with_stream(pmem_allocator<> &pm_allocator,
             leaf_node *l, typename std::vector<kv_pair>::iterator &upsert_kvs_sit,
             const typename std::vector<kv_pair>::iterator &upsert_kvs_eit, bool cv,
             int &split_merges)
         {
             ++split_merges;
             bool nv = !cv;
-            std::vector<leaf_node *> leafs = {new_leaf_node()};
+            std::vector<leaf_node *> leafs = {new_leaf_node(pm_allocator)};
             int l_key_count = l->key_count(cv);
             int l_free_cells = l->free_cells(cv);
             int i = 0;
@@ -636,12 +709,12 @@ public:
                          // moves
             leaf_node *last_leaf = leafs.back();
             auto ensure_last_leaf_capacity = [&last_leaf, &leafs, nv,
-                                              &node_alloc_bitmap]() {
+                                              &node_alloc_bitmap, &pm_allocator]() {
                 if (last_leaf->key_count(nv) >=
                     max_initial_fill_keys)
                 { // last leaf is full, create a new leaf and
                     // establish the chain
-                    auto new_sibling = new_leaf_node();
+                    auto new_sibling = new_leaf_node(pm_allocator);
                     last_leaf->set_max_key(nv);
                     assert(last_leaf->key_count(nv) == node_alloc_bitmap->popcount());
                     *last_leaf->next_sibling_ref(nv) = new_sibling;
@@ -784,7 +857,7 @@ public:
         // Return the last leaf node whose keys <= this->max_key() after the kvs are
         // upserted.
         leaf_node *
-        bulk_upsert(leaf_node **prev_ref,
+        bulk_upsert(pmem_allocator<>& pm_allocator, leaf_node **prev_ref,
                     typename std::vector<kv_pair>::iterator &upsert_kvs_sit,
                     const typename std::vector<kv_pair>::iterator &upsert_kvs_eit,
                     bool cv, std::unordered_set<leaf_node *> &gc_candidates,
@@ -804,7 +877,7 @@ public:
                 // keys <= this->max_key, split instead
                 // We merge the stream [upsert_kvs_sit, tit) with this leaf by creating
                 // as many leaf nodes as needed.
-                auto leafs = leaf_node::split_node_with_stream(
+                auto leafs = leaf_node::split_node_with_stream(pm_allocator,
                     this, upsert_kvs_sit, upsert_kvs_eit, cv, split_merges);
                 assert(leafs.size() >= 1);
                 auto last_leaf = leafs.back();
@@ -927,21 +1000,21 @@ public:
         }
 
         static std::vector<leaf_node *>
-        merge_multiple_nodes(std::vector<leaf_node *> leafs, const int total_keys,
+        merge_multiple_nodes(pmem_allocator<> &pm_allocator, std::vector<leaf_node *> leafs, const int total_keys,
                              bool nv)
         {
             const int keys_per_node = std::ceil(total_keys / 2.0);
-            std::vector<leaf_node *> merged_leafs = {new_leaf_node()};
+            std::vector<leaf_node *> merged_leafs = {new_leaf_node(pm_allocator)};
             std::hash<key_type> hasher;
             bitmap *node_alloc_bitmap = &merged_leafs.back()->meta[nv].get_bitmap();
             leaf_node *last_leaf = merged_leafs.back();
             auto ensure_last_leaf_capacity = [&last_leaf, &merged_leafs, nv,
-                                              &node_alloc_bitmap, &keys_per_node]() {
+                                              &node_alloc_bitmap, &keys_per_node, &pm_allocator]() {
                 if (last_leaf->key_count(nv) >=
                     keys_per_node)
                 { // last leaf is full, create a new leaf and
                     // establish the chain
-                    auto new_sibling = new_leaf_node();
+                    auto new_sibling = new_leaf_node(pm_allocator);
                     last_leaf->set_max_key(nv);
                     assert(last_leaf->key_count(nv) == node_alloc_bitmap->popcount());
                     *last_leaf->next_sibling_ref(nv) = new_sibling;
@@ -979,7 +1052,8 @@ public:
         // Return the next node to be examined.
 
         static leaf_node *
-        merge_underutilized_node(leaf_node **&prev_ref, leaf_node *l1, bool nv,
+        merge_underutilized_node(pmem_allocator<>& pm_allocator,
+                                 leaf_node **&prev_ref, leaf_node *l1, bool nv,
                                  std::unordered_set<leaf_node *> &gc_candidates,
                                  int &node_merges_transfer,
                                  int &node_merges_combine,
@@ -1037,7 +1111,7 @@ public:
                 }
                 // TODO: garabge collect leafs
                 std::vector<leaf_node *> merged_leafs =
-                    merge_multiple_nodes(leafs, total_keys, nv);
+                    merge_multiple_nodes(pm_allocator, leafs, total_keys, nv);
                 assert(merged_leafs.size() == 2);
                 *prev_ref = merged_leafs[0];
                 last_leaf = merged_leafs.back();
@@ -1058,10 +1132,11 @@ public:
             return kv_count.load() / (node_count.load() * key_capacity + 1.0);
         }
     };
-    concur_cvhtree(double &inner_nodes_build_time,
+    concur_cvhtree(std::shared_ptr<pmem_allocator<>> pm_allocator, double &inner_nodes_build_time,
                    double &parallel_merge_work_time)
         : art_tree_build_time(inner_nodes_build_time),
-          parallel_merge_work_time(parallel_merge_work_time), pool(nullptr)
+          parallel_merge_work_time(parallel_merge_work_time), pool(nullptr),
+          pm_allocator(pm_allocator)
     {
         memset(stats, 0, sizeof(stats));
         memset(head, 0, sizeof(head));
@@ -1192,7 +1267,7 @@ public:
 
     // scan leafs for keys in [start_key, end_key)
     void range_scan(const key_type &start_key, const key_type &end_key,
-                    std::vector<value_type> &values,
+                    std::vector<std::pair<key_type, value_type>> &values,
                     std::function<void(value_type)> processor)
     {
         assert(start_key <= end_key);
@@ -1200,7 +1275,7 @@ public:
         auto it = lower_bound(start_key);
         while (it != eit && it.key() < end_key)
         {
-            values.push_back(it.value());
+            values.push_back(std::make_pair<key_type, value_type>(it.key(), it.value()));
             ++it;
         }
     }
@@ -1330,7 +1405,7 @@ public:
                     auto next = cur->next_sibling(cv);
                     //if (next != task.end_leaf)
                     prefetch((char *)cur, sizeof(leaf_node));
-                    cur = cur->bulk_upsert(prev_ref, ustart, uend, cv, gc_candidates,
+                    cur = cur->bulk_upsert(*pm_allocator.get(), prev_ref, ustart, uend, cv, gc_candidates,
                                            update_inplace, split_merges, perserve_l);
                     prev_ref = cur->next_sibling_ref(nv);
                     assert(*prev_ref == next);
@@ -1353,7 +1428,7 @@ public:
                     auto uend = upsert_kvs.end();
                     // auto next = *prev_ref;
                     // assert(next == nullptr);
-                    auto leafs = leaf_node::split_merge_node_with_stream(
+                    auto leafs = leaf_node::split_merge_node_with_stream(*pm_allocator.get(),
                         &empty_node, ustart, uend, cv, split_merges);
                     assert(leafs.empty() == false);
                     assert(leafs.back()->next_sibling(nv) == nullptr);
@@ -1415,7 +1490,7 @@ public:
                 while (cur != task.end_leaf)
                 {
                     //prefetch((char *)cur->next_sibling(nv), sizeof(leaf_node));
-                    cur = leaf_node::merge_underutilized_node(
+                    cur = leaf_node::merge_underutilized_node(*pm_allocator.get(),
                         prev_ref, cur, nv, gc_candidates, node_merges_transfer,
                         node_merges_combine, task.last_leaf, task.end_leaf);
                 }
@@ -1697,7 +1772,7 @@ public:
             {
                 for (auto node : merge_worker_stats[i].gc_candidates)
                 {
-                    leaf_node::delete_leaf_node(node);
+                    leaf_node::delete_leaf_node(*pm_allocator.get(), node);
                 }
             }
             delete old_tree;
@@ -1894,47 +1969,17 @@ struct log_record
         //h = (std::hash<int>()(static_cast<int>(type)) << 1) ^
         //    (std::hash<key_type>()(key) << 2) ^ (std::hash<value_type>()(val));
     }
-    log_record(op_type type, const key_type &key) : type(type), key(key), val()
-    {
-        //h = (std::hash<int>()(static_cast<int>(type)) << 1) ^
-        //    (std::hash<key_type>()(key) << 2) ^ (std::hash<value_type>()(val));
-    }
 };
 
-template <int PageSize = 64 * 1024>
-struct log_page
-{
-    uint64_t off;
-    using log_page_type = log_page<PageSize>;
-    log_page_type *next;
-    uint8_t __padding__[END_PADDING_SIZE(sizeof(off) + sizeof(next))];
-    char storage[];
-    log_page() : off(0), next(nullptr) {}
-    static constexpr int page_size = PageSize;
-    static constexpr int meta_size = sizeof(off) + sizeof(next) + sizeof(__padding__);
-    static constexpr int effective_storage_size = page_size - meta_size;
-    static log_page_type *new_log_page()
-    {
-        void *ptr = nullptr;
-        auto res = nvm_dram_alloc(&ptr, cacheline_size, PageSize);
-        if (res == 0)
-        {
-            return new (ptr) log_page_type();
-        }
-        return nullptr;
-    }
-    static void delete_log_page(log_page_type *p)
-    {
-        nvm_dram_free(p, PageSize);
-    }
-};
 
 template <int PageSize = 64 * 1024>
 class caching_log_page_allocator
 {
   public:
     static constexpr int fill_batch_size = 16;
-    caching_log_page_allocator() : freelist(nullptr) {}
+    std::shared_ptr<pmem_allocator<>> pm_allocator;
+    explicit caching_log_page_allocator() : freelist(nullptr) {
+    }
 
     log_page<PageSize> *allocate_page()
     {
@@ -1945,10 +1990,10 @@ class caching_log_page_allocator
             {
                 for (int i = 0; i < fill_batch_size; ++i)
                 {
-                    auto page = log_page<PageSize>::new_log_page();
-                    page->next = freelist;
-                    freelist = page;
-                    clflush_then_sfence(&freelist);
+                  auto page = pm_allocator->new_log_page();
+                  page->next = freelist;
+                  freelist = page;
+                  clflush_then_sfence(&freelist);
                 }
             }
             ret = freelist;
@@ -1994,7 +2039,6 @@ class lockfree_pwal
     log_page_type *tailp;
     log_page_allocator_type *allocator;
     std::atomic_int &record_count_approx;
-    std::mutex wal_mtx;
     lockfree_pwal(caching_log_page_allocator<PageSize> *allocator, std::atomic_int &record_count_approx) : tailp(nullptr), allocator(allocator), record_count_approx(record_count_approx) {
         if (tailp == nullptr)
             add_new_tail_page(tailp);
@@ -2057,31 +2101,11 @@ class lockfree_pwal
             goto restart;
         }
     }
-    template<class F>
-    void for_each_record(F f) {
-        std::vector<log_page_type*> pages;
-        auto p = tailp;
-        while (p) {
-            pages.push_back(p);
-            p = p->next;
-        }
-        for (int i = (int)pages.size() - 1; i >= 0; --i) {
-            log_page_type * p = pages[i];
-            size_t off = 0;
-            while (off + sizeof(log_record_type) <= log_page_type::effective_storage_size) {
-                log_record_type  * rp = reinterpret_cast<log_record_type *>(p->storage + off);
-                f(*rp);
-                off += sizeof(log_record_type);
-            }
-        }
-    }
 };
 
 constexpr int stripes = 60;
 constexpr double bloom_err_rate = 0.05;
 constexpr double merge_threshold = 0.07;
-static thread_local void *log_addr = nullptr;
-static thread_local void *cacheline_addr = nullptr;
 
 template <class Key, class Value>
 class durable_concur_buffer_btree
@@ -2093,7 +2117,9 @@ class durable_concur_buffer_btree
     using lock_guard_type = std::lock_guard<std::mutex>;
     using log_type = lockfree_pwal<key_type, value_type>;
     static thread_local log_record<key_type, value_type> *local_record;
-    durable_concur_buffer_btree(size_t expected_size, caching_log_page_allocator<> *allocator) : approx_size(0)
+    std::shared_ptr<pmem_allocator<>> pm_allocator;
+
+    durable_concur_buffer_btree(std::shared_ptr<pmem_allocator<>> pm_allocator, size_t expected_size, caching_log_page_allocator<> *allocator) : approx_size(0), pm_allocator(pm_allocator)
     {
         btree = new btreeolc::BTree<key_type, value_type>();
         cap = expected_size = std::max(expected_size, (size_t)1000);
@@ -2139,7 +2165,7 @@ class durable_concur_buffer_btree
     {
         if (local_record == nullptr)
         {
-            nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
+            pm_allocator->nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
         }
         auto btree_leaf_insert_func = [&key, &value, this]() {
             *local_record = log_record<key_type, value_type>(op_type::upsertion, key, value);
@@ -2155,7 +2181,7 @@ class durable_concur_buffer_btree
     {
         if (local_record == nullptr)
         {
-            nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
+          pm_allocator->nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
         }
         auto btree_leaf_insert_func = [&key, &value, this]() {
             *local_record = log_record<key_type, value_type>(op_type::upsertion, key, value);
@@ -2204,121 +2230,7 @@ class durable_concur_buffer_btree
 };
 
 template <class Key, class Value>
-class durable_concur_buffer_art
-{
-public:
-    using key_type = Key;
-    using value_type = Value;
-    using concur_bloom_type = bloom1<key_type>;
-    using lock_guard_type = std::lock_guard<std::mutex>;
-    using log_type = lockfree_pwal<key_type, value_type>;
-    static thread_local log_record<key_type, value_type> *local_record;
-    durable_concur_buffer_art(size_t expected_size, caching_log_page_allocator<> *allocator) : approx_size(0), index(8)
-    {
-        cap = expected_size = std::max(expected_size, (size_t)1000);
-        bloom = new concur_bloom_type(expected_size, bloom_err_rate);
-        logs.reserve(stripes);
-        for (int i = 0; i < stripes; ++i)
-        {
-            logs[i] = new log_type(allocator, approx_size);
-        }
-    }
-
-    void clear_log_pages() {
-        for (int i = 0; i < stripes; ++i)
-        {
-            delete logs[i];
-        }
-    }
-    ~durable_concur_buffer_art()
-    {
-        delete bloom;
-        clear_log_pages();
-    }
-
-    bool lookup(const key_type &key, value_type &value)
-    {
-        if (bloom->check(key))
-        {
-            return index.find(key, value);
-        }
-        return false;
-    }
-
-    void insert(const key_type &key, const value_type &value)
-    {
-        if (local_record == nullptr)
-        {
-            nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
-        }
-        auto leaf_insert_func = [&key, &value, this]() {
-            *local_record = log_record<key_type, value_type>(op_type::upsertion, key, value);
-            int id = std::hash<key_type>()(key) % stripes;
-            logs[id]->append_and_flush(local_record);
-            bloom->insert(key);
-        };
-        index.insert(key, value, leaf_insert_func);
-    }
-
-    template<typename F>
-    void update(const key_type &key, const value_type &value, F should_insert_func)
-    {
-        if (local_record == nullptr)
-        {
-            nvm_dram_alloc((void**)&local_record, cacheline_size, cacheline_size);
-        }
-        auto leaf_insert_func = [&key, &value, this]() {
-            *local_record = log_record<key_type, value_type>(op_type::upsertion, key, value);
-            int id = std::hash<key_type>()(key) % stripes;
-            logs[id]->append_and_flush(local_record);
-            bloom->insert(key);
-            //++approx_size;
-        };
-        index.insert(key, value, leaf_insert_func);
-    }
-
-    typename ArtOLCIndex<key_type>::iterator
-    begin_unsafe()
-    {
-        return index.begin();
-    }
-
-    typename ArtOLCIndex<key_type>::iterator end_unsafe()
-    {
-        return index.end();
-    }
-
-    size_t size() { return approx_size.load(std::memory_order_relaxed); }
-    size_t capacity() { return cap; }
-    size_t real_size()
-    {
-        size_t c = approx_size;
-        for (int i = 0; i < stripes; ++i)
-        {
-            c += logs[i]->record_count_in_current_page();
-        }
-        return c;
-    }
-
-    typename ArtOLCIndex<key_type>::iterator lookup_range(const key_type & start_key) {
-        return index.lookup_range(start_key);
-    }
-
-private:
-    // volatile states
-    ArtOLCIndex<key_type> index;
-    concur_bloom_type *bloom;
-    std::atomic_int approx_size;
-    size_t cap;
-    std::vector<log_type *> logs;
-    // persistent states
-};
-
-template <class Key, class Value>
 thread_local log_record<Key, Value> *durable_concur_buffer_btree<Key, Value>::local_record = nullptr;
-
-template <class Key, class Value>
-thread_local log_record<Key, Value> *durable_concur_buffer_art<Key, Value>::local_record = nullptr;
 
 template <class Key, class Value>
 class concur_dptree
@@ -2329,15 +2241,22 @@ class concur_dptree
     using buffer_btree_type = durable_concur_buffer_btree<key_type, value_type>;
     using base_tree_type = concur_cvhtree<key_type, value_type>;
     caching_log_page_allocator<> allocator;
-    concur_dptree()
+
+
+    explicit concur_dptree(std::string path)
         : base_tree_inner_rebuild_time(0), base_tree_parallel_merge_work_time(0),
-          merge_state(0), merge_time(0), merge_wait_time(0)
+          merge_state(0), merge_time(0), merge_wait_time(0),
+          pm_allocator(std::make_shared<pmem_allocator<>>(path))
     {
-        front_buffer_tree = new buffer_btree_type(1024, &allocator);
+      allocator.pm_allocator = pm_allocator;
+        front_buffer_tree = new buffer_btree_type(pm_allocator, 1024, &allocator);
         middle_buffer_tree = nullptr;
-        rear_base_tree = new base_tree_type(base_tree_inner_rebuild_time,
+        rear_base_tree = new base_tree_type(pm_allocator, base_tree_inner_rebuild_time,
                                             base_tree_parallel_merge_work_time);
+
+
     }
+
     size_t size() { return front_buffer_tree->real_size() + rear_base_tree->size(); }
     size_t get_buffer_tree_size() { return front_buffer_tree->real_size(); }
     size_t get_probes() { return rear_base_tree->get_probes(); }
@@ -2435,7 +2354,7 @@ class concur_dptree
                 }
             }
 
-            auto should_insert_f_cpbt = [&key, &value, this](const key_type &key) -> bool {
+            auto should_insert_f_cpbt = [&key, &value, this](const key_type &x) -> bool {
                 return true;
             };
             buffer_tree->update(key, make_upsert_value(value), should_insert_f_cpbt);
@@ -2449,7 +2368,7 @@ class concur_dptree
         }
     }
 
-    void lookup_range(const key_type &start_key, int scan_size, std::vector<value_type> &values)
+    void lookup_range(const key_type &start_key, int scan_size, std::vector<std::pair<key_type, value_type>> &values)
     {
         // register reader
         front_reader_local_epoch.register_to_manager(&front_reader_epoch_manager);
@@ -2476,33 +2395,33 @@ class concur_dptree
             while (scan_cnt < scan_size && front_it.is_end() == false && mid_it.is_end() == false && rear_it != rear_end) {
                 if (front_it.key() < mid_it.key()) {
                     if (front_it.key() <= rear_it.key()) {
-                        values.emplace_back(front_it.value());
+                        values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                         ++front_it;
                         if (front_it.key() == rear_it.key())
                             ++rear_it;
                     } else {
-                        values.emplace_back(rear_it.value());
+                        values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                         ++rear_it;
                     }
                 } else if (front_it.key() == mid_it.key()) {
                     if (front_it.key() <= rear_it.key()) {
-                        values.emplace_back(front_it.value());
+                        values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                         ++front_it;
                         ++mid_it;
                         if (front_it.key() == rear_it.key())
                             ++rear_it;
                     } else {
-                        values.emplace_back(rear_it.value());
+                        values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                         ++rear_it;
                     }
                 } else {
                     if (mid_it.key() <= rear_it.key()) {
-                        values.emplace_back(mid_it.value());
+                        values.emplace_back(std::make_pair<>(mid_it.key(), mid_it.value()));
                         ++mid_it;
                         if (mid_it.key() == rear_it.key())
                             ++rear_it;
                     } else {
-                        values.emplace_back(rear_it.value());
+                        values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                         ++rear_it;
                     }
                 }
@@ -2510,52 +2429,52 @@ class concur_dptree
             }
             while (scan_cnt < scan_size && front_it.is_end() == false && mid_it.is_end() == false) {
                 if (front_it.key() <= mid_it.key()) {
-                    values.emplace_back(front_it.value());
+                    values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                     ++front_it;
                     if (front_it.key() == mid_it.key())
                         ++mid_it;
                 } else {
-                    values.emplace_back(mid_it.value());
+                    values.emplace_back(std::make_pair<>(mid_it.key(), mid_it.value()));
                     ++mid_it;
                 }
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && front_it.is_end() == false && rear_it != rear_end) {
                 if (front_it.key() <= rear_it.key()) {
-                    values.emplace_back(front_it.value());
+                    values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                     ++front_it;
                     if (front_it.key() == rear_it.key())
                         ++rear_it;
                 } else {
-                    values.emplace_back(rear_it.value());
+                    values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                     ++rear_it;
                 }
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && mid_it.is_end() == false && rear_it != rear_end) {
                 if (mid_it.key() <= rear_it.key()) {
-                    values.emplace_back(mid_it.value());
+                    values.emplace_back(std::make_pair<>(mid_it.key(), mid_it.value()));
                     ++mid_it;
                     if (mid_it.key() == rear_it.key())
                         ++rear_it;
                 } else {
-                    values.emplace_back(rear_it.value());
+                    values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                     ++rear_it;
                 }
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && front_it.is_end() == false) {
-                values.emplace_back(front_it.value());
+                values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                 ++front_it;
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && mid_it.is_end() == false) {
-                values.emplace_back(mid_it.value());
+                values.emplace_back(std::make_pair<>(mid_it.key(), mid_it.value()));
                 ++mid_it;
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && rear_it != rear_end) {
-                values.emplace_back(rear_it.value());
+                values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                 ++rear_it;
                 ++scan_cnt;
             }
@@ -2569,23 +2488,23 @@ class concur_dptree
 
             while (scan_cnt < scan_size && front_it.is_end() == false && rear_it != rear_end) {
                 if (front_it.key() <= rear_it.key()) {
-                    values.emplace_back(front_it.value());
+                    values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                     ++front_it;
                     if (front_it.key() == rear_it.key())
                         ++rear_it;
                 } else {
-                    values.emplace_back(rear_it.value());
+                    values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                     ++rear_it;
                 }
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && front_it.is_end() == false) {
-                values.emplace_back(front_it.value());
+                values.emplace_back(std::make_pair<>(front_it.key(), front_it.value()));
                 ++front_it;
                 ++scan_cnt;
             }
             while (scan_cnt < scan_size && rear_it != rear_end) {
-                values.emplace_back(rear_it.value());
+                values.emplace_back(std::make_pair<>(rear_it.key(), rear_it.value()));
                 ++rear_it;
                 ++scan_cnt;
             }
@@ -2683,7 +2602,7 @@ class concur_dptree
 
                 auto old_front_buffer_tree = front_buffer_tree;
                 auto new_front_buffer_tree =
-                        new buffer_btree_type(expected_new_buffer_tree_size, &allocator);
+                        new buffer_btree_type(pm_allocator, expected_new_buffer_tree_size, &allocator);
                 // make the full front tree as the middle tree for read-only workloads
                 assert(middle_buffer_tree == nullptr);
                 __atomic_store_n(&middle_buffer_tree, old_front_buffer_tree, __ATOMIC_SEQ_CST);
@@ -2747,6 +2666,9 @@ class concur_dptree
     double base_tree_parallel_merge_work_time;
     double merge_time;
     std::atomic<double> merge_wait_time;
+
+    std::shared_ptr<pmem_allocator<>> pm_allocator;
+
     double flush_time;
     epoch_manager front_writer_epoch_manager;
     epoch_manager front_reader_epoch_manager;
